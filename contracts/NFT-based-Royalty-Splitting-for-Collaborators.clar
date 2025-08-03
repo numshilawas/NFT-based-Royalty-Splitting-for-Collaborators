@@ -3,6 +3,8 @@
   (define-constant err-not-found (err u101))
   (define-constant err-invalid-percentage (err u102))
   (define-constant err-already-exists (err u103))
+  (define-constant err-vesting-not-started (err u104))
+  (define-constant err-no-vested-amount (err u105))
 
   (define-map collaborators-map 
     { nft-id: uint, collaborator: principal }
@@ -144,9 +146,19 @@
 )
 
 (define-map collaborator-payments
-  { nft-id: uint, collaborator: principal }
-  { total-received: uint, last-payment: uint }
+{ nft-id: uint, collaborator: principal }
+{ total-received: uint, last-payment: uint }
 )
+
+  (define-map vesting-schedules
+    { nft-id: uint, collaborator: principal }
+    {
+      total-amount: uint,
+      start-block: uint,
+      duration-blocks: uint,
+      claimed-amount: uint
+    }
+  )
 
 (define-read-only (get-collaborator-earnings (nft-id uint) (collaborator principal))
   (map-get? collaborator-payments { nft-id: nft-id, collaborator: collaborator })
@@ -254,4 +266,83 @@
 
 (define-read-only (get-sale-history (nft-id uint) (sale-id uint))
   (map-get? sales-history { nft-id: nft-id, sale-id: sale-id })
+)
+
+(define-public (create-vesting-schedule (nft-id uint) (collaborator principal) (total-amount uint) (duration-blocks uint))
+  (let
+    (
+      (metadata (unwrap! (map-get? nft-metadata { nft-id: nft-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator metadata)) err-owner-only)
+    (asserts! (> duration-blocks u0) err-invalid-percentage)
+    (asserts! (> total-amount u0) err-invalid-percentage)
+    (map-set vesting-schedules
+      { nft-id: nft-id, collaborator: collaborator }
+      {
+        total-amount: total-amount,
+        start-block: stacks-block-height,
+        duration-blocks: duration-blocks,
+        claimed-amount: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (calculate-vested-amount (nft-id uint) (collaborator principal))
+  (let
+    (
+      (schedule (unwrap! (map-get? vesting-schedules { nft-id: nft-id, collaborator: collaborator }) err-not-found))
+      (current-block stacks-block-height)
+      (start-block (get start-block schedule))
+      (duration (get duration-blocks schedule))
+      (total-amount (get total-amount schedule))
+      (elapsed-blocks (if (> current-block start-block) (- current-block start-block) u0))
+    )
+    (if (>= elapsed-blocks duration)
+      (ok total-amount)
+      (ok (/ (* total-amount elapsed-blocks) duration))
+    )
+  )
+)
+
+(define-public (claim-vested-royalties (nft-id uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? vesting-schedules { nft-id: nft-id, collaborator: tx-sender }) err-not-found))
+      (vested-amount (unwrap! (calculate-vested-amount nft-id tx-sender) err-invalid-percentage))
+      (claimed-amount (get claimed-amount schedule))
+      (claimable-amount (- vested-amount claimed-amount))
+    )
+    (asserts! (>= stacks-block-height (get start-block schedule)) err-vesting-not-started)
+    (asserts! (> claimable-amount u0) err-no-vested-amount)
+    (map-set vesting-schedules
+      { nft-id: nft-id, collaborator: tx-sender }
+      (merge schedule { claimed-amount: vested-amount })
+    )
+    (try! (as-contract (stx-transfer? claimable-amount tx-sender tx-sender)))
+    (ok claimable-amount)
+  )
+)
+
+(define-read-only (get-vesting-info (nft-id uint) (collaborator principal))
+  (match (map-get? vesting-schedules { nft-id: nft-id, collaborator: collaborator })
+    some-schedule 
+      (let
+        (
+          (vested-result (calculate-vested-amount nft-id collaborator))
+          (vested-amount (match vested-result ok-val ok-val err-val u0))
+          (claimed-amount (get claimed-amount some-schedule))
+        )
+        (ok {
+          total-amount: (get total-amount some-schedule),
+          start-block: (get start-block some-schedule),
+          duration-blocks: (get duration-blocks some-schedule),
+          vested-amount: vested-amount,
+          claimed-amount: claimed-amount,
+          claimable-amount: (- vested-amount claimed-amount)
+        })
+      )
+    err-not-found
+  )
 )
