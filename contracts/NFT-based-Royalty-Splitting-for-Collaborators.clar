@@ -346,3 +346,102 @@
     err-not-found
   )
 )
+
+(define-constant err-offer-exists (err u106))
+(define-constant err-offer-expired (err u107))
+(define-constant err-insufficient-offer (err u108))
+
+(define-map nft-offers
+  { nft-id: uint, offer-id: uint }
+  {
+    offerer: principal,
+    amount: uint,
+    expiry-block: uint,
+    active: bool
+  }
+)
+
+(define-data-var offer-counter uint u0)
+
+(define-public (make-offer (nft-id uint) (amount uint) (duration-blocks uint))
+  (let
+    (
+      (offer-id (+ (var-get offer-counter) u1))
+      (expiry-block (+ stacks-block-height duration-blocks))
+    )
+    (asserts! (> amount u0) err-invalid-percentage)
+    (asserts! (> duration-blocks u0) err-invalid-percentage)
+    (asserts! (is-some (map-get? nft-metadata { nft-id: nft-id })) err-not-found)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set nft-offers
+      { nft-id: nft-id, offer-id: offer-id }
+      {
+        offerer: tx-sender,
+        amount: amount,
+        expiry-block: expiry-block,
+        active: true
+      }
+    )
+    (var-set offer-counter offer-id)
+    (ok offer-id)
+  )
+)
+
+(define-public (accept-offer (nft-id uint) (offer-id uint))
+  (let
+    (
+      (offer (unwrap! (map-get? nft-offers { nft-id: nft-id, offer-id: offer-id }) err-not-found))
+      (nft-owner (unwrap! (nft-get-owner? collaborative-nft nft-id) err-not-found))
+      (offerer (get offerer offer))
+      (amount (get amount offer))
+      (royalty-rate u10)
+      (royalty-amount (/ (* amount royalty-rate) u100))
+      (seller-amount (- amount royalty-amount))
+    )
+    (asserts! (is-eq tx-sender nft-owner) err-owner-only)
+    (asserts! (get active offer) err-not-found)
+    (asserts! (< stacks-block-height (get expiry-block offer)) err-offer-expired)
+    (try! (as-contract (stx-transfer? seller-amount tx-sender nft-owner)))
+    (if (> royalty-amount u0)
+      (try! (as-contract (distribute-royalty nft-id royalty-amount)))
+      true
+    )
+    (try! (nft-transfer? collaborative-nft nft-id nft-owner offerer))
+    (map-set nft-offers
+      { nft-id: nft-id, offer-id: offer-id }
+      (merge offer { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-offer (nft-id uint) (offer-id uint))
+  (let
+    (
+      (offer (unwrap! (map-get? nft-offers { nft-id: nft-id, offer-id: offer-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get offerer offer)) err-owner-only)
+    (asserts! (get active offer) err-not-found)
+    (try! (as-contract (stx-transfer? (get amount offer) tx-sender (get offerer offer))))
+    (map-set nft-offers
+      { nft-id: nft-id, offer-id: offer-id }
+      (merge offer { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-offer (nft-id uint) (offer-id uint))
+  (map-get? nft-offers { nft-id: nft-id, offer-id: offer-id })
+)
+
+(define-read-only (is-offer-valid (nft-id uint) (offer-id uint))
+  (match (map-get? nft-offers { nft-id: nft-id, offer-id: offer-id })
+    some-offer 
+      (and 
+        (get active some-offer)
+        (< stacks-block-height (get expiry-block some-offer))
+      )
+    false
+  )
+)
