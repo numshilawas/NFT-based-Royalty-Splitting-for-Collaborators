@@ -213,12 +213,14 @@
       (listing (unwrap! (map-get? marketplace-listings { nft-id: nft-id }) err-not-found))
       (seller (get seller listing))
       (price (get price listing))
-      (royalty-rate (get royalty-percentage listing))
+      (dynamic-royalty-rate (unwrap! (get-current-royalty-rate nft-id) err-invalid-percentage))
+      (royalty-rate dynamic-royalty-rate)
       (royalty-amount (/ (* price royalty-rate) u100))
       (seller-amount (- price royalty-amount))
       (sale-id (+ (var-get sale-counter) u1))
     )
     (asserts! (get active listing) err-not-found)
+    (initialize-sales-performance nft-id)
     (try! (stx-transfer? price tx-sender (as-contract tx-sender)))
     (try! (as-contract (stx-transfer? seller-amount tx-sender seller)))
     (if (> royalty-amount u0)
@@ -226,6 +228,7 @@
       true
     )
     (try! (nft-transfer? collaborative-nft nft-id seller tx-sender))
+    (update-sales-performance nft-id price)
     (map-set marketplace-listings
       { nft-id: nft-id }
       (merge listing { active: false })
@@ -350,6 +353,8 @@
 (define-constant err-offer-exists (err u106))
 (define-constant err-offer-expired (err u107))
 (define-constant err-insufficient-offer (err u108))
+(define-constant err-milestone-not-reached (err u109))
+(define-constant err-invalid-milestone (err u110))
 
 (define-map nft-offers
   { nft-id: uint, offer-id: uint }
@@ -394,19 +399,22 @@
       (nft-owner (unwrap! (nft-get-owner? collaborative-nft nft-id) err-not-found))
       (offerer (get offerer offer))
       (amount (get amount offer))
-      (royalty-rate u10)
+      (dynamic-royalty-rate (unwrap! (get-current-royalty-rate nft-id) err-invalid-percentage))
+      (royalty-rate dynamic-royalty-rate)
       (royalty-amount (/ (* amount royalty-rate) u100))
       (seller-amount (- amount royalty-amount))
     )
     (asserts! (is-eq tx-sender nft-owner) err-owner-only)
     (asserts! (get active offer) err-not-found)
     (asserts! (< stacks-block-height (get expiry-block offer)) err-offer-expired)
+    (initialize-sales-performance nft-id)
     (try! (as-contract (stx-transfer? seller-amount tx-sender nft-owner)))
     (if (> royalty-amount u0)
       (try! (as-contract (distribute-royalty nft-id royalty-amount)))
       true
     )
     (try! (nft-transfer? collaborative-nft nft-id nft-owner offerer))
+    (update-sales-performance nft-id amount)
     (map-set nft-offers
       { nft-id: nft-id, offer-id: offer-id }
       (merge offer { active: false })
@@ -443,5 +451,151 @@
         (< stacks-block-height (get expiry-block some-offer))
       )
     false
+  )
+)
+
+(define-map sales-performance
+  { nft-id: uint }
+  {
+    total-sales: uint,
+    total-volume: uint,
+    current-royalty-rate: uint
+  }
+)
+
+(define-map royalty-milestones
+  { nft-id: uint, milestone-id: uint }
+  {
+    sales-threshold: uint,
+    volume-threshold: uint,
+    new-royalty-rate: uint,
+    activated: bool
+  }
+)
+
+(define-data-var milestone-counter uint u0)
+
+(define-public (set-royalty-milestone (nft-id uint) (sales-threshold uint) (volume-threshold uint) (new-royalty-rate uint))
+  (let
+    (
+      (metadata (unwrap! (map-get? nft-metadata { nft-id: nft-id }) err-not-found))
+      (milestone-id (+ (var-get milestone-counter) u1))
+    )
+    (asserts! (is-eq tx-sender (get creator metadata)) err-owner-only)
+    (asserts! (<= new-royalty-rate u30) err-invalid-percentage)
+    (asserts! (or (> sales-threshold u0) (> volume-threshold u0)) err-invalid-milestone)
+    (map-set royalty-milestones
+      { nft-id: nft-id, milestone-id: milestone-id }
+      {
+        sales-threshold: sales-threshold,
+        volume-threshold: volume-threshold,
+        new-royalty-rate: new-royalty-rate,
+        activated: false
+      }
+    )
+    (var-set milestone-counter milestone-id)
+    (ok milestone-id)
+  )
+)
+
+(define-private (initialize-sales-performance (nft-id uint))
+  (if (is-none (map-get? sales-performance { nft-id: nft-id }))
+    (map-set sales-performance
+      { nft-id: nft-id }
+      {
+        total-sales: u0,
+        total-volume: u0,
+        current-royalty-rate: u10
+      }
+    )
+    false
+  )
+)
+
+(define-private (update-sales-performance (nft-id uint) (sale-price uint))
+  (let
+    (
+      (performance (default-to 
+        { total-sales: u0, total-volume: u0, current-royalty-rate: u10 }
+        (map-get? sales-performance { nft-id: nft-id })
+      ))
+      (new-total-sales (+ (get total-sales performance) u1))
+      (new-total-volume (+ (get total-volume performance) sale-price))
+    )
+    (map-set sales-performance
+      { nft-id: nft-id }
+      {
+        total-sales: new-total-sales,
+        total-volume: new-total-volume,
+        current-royalty-rate: (get current-royalty-rate performance)
+      }
+    )
+    true
+  )
+)
+
+(define-private (check-and-activate-milestones (nft-id uint) (milestone-id uint))
+  (let
+    (
+      (milestone (map-get? royalty-milestones { nft-id: nft-id, milestone-id: milestone-id }))
+      (performance (map-get? sales-performance { nft-id: nft-id }))
+    )
+    (match milestone
+      some-milestone
+        (match performance
+          some-performance
+            (if (and 
+                  (not (get activated some-milestone))
+                  (or
+                    (and (> (get sales-threshold some-milestone) u0) (>= (get total-sales some-performance) (get sales-threshold some-milestone)))
+                    (and (> (get volume-threshold some-milestone) u0) (>= (get total-volume some-performance) (get volume-threshold some-milestone)))
+                  )
+                )
+              (begin
+                (map-set royalty-milestones
+                  { nft-id: nft-id, milestone-id: milestone-id }
+                  (merge some-milestone { activated: true })
+                )
+                (map-set sales-performance
+                  { nft-id: nft-id }
+                  (merge some-performance { current-royalty-rate: (get new-royalty-rate some-milestone) })
+                )
+                true
+              )
+              false
+            )
+          false
+        )
+      false
+    )
+  )
+)
+
+(define-public (trigger-milestone-check (nft-id uint) (milestone-id uint))
+  (let
+    (
+      (metadata (unwrap! (map-get? nft-metadata { nft-id: nft-id }) err-not-found))
+      (milestone (unwrap! (map-get? royalty-milestones { nft-id: nft-id, milestone-id: milestone-id }) err-not-found))
+    )
+    (asserts! (not (get activated milestone)) err-already-exists)
+    (if (check-and-activate-milestones nft-id milestone-id)
+      (ok true)
+      err-milestone-not-reached
+    )
+  )
+)
+
+(define-read-only (get-sales-performance (nft-id uint))
+  (map-get? sales-performance { nft-id: nft-id })
+)
+
+(define-read-only (get-royalty-milestone (nft-id uint) (milestone-id uint))
+  (map-get? royalty-milestones { nft-id: nft-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-current-royalty-rate (nft-id uint))
+  (match (map-get? sales-performance { nft-id: nft-id })
+    some-performance (ok (get current-royalty-rate some-performance))
+    (ok u10)
   )
 )
