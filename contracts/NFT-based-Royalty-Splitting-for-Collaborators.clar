@@ -133,7 +133,7 @@
     )
     (if (> payment-amount u0)
       (begin
-        ;; In a real implementation, handle the stx-transfer properly
+        (distribute-to-pool (get nft-id collaborator-data) (get collaborator collaborator-data) payment-amount)
         total-amount
       )
       total-amount
@@ -355,6 +355,8 @@
 (define-constant err-insufficient-offer (err u108))
 (define-constant err-milestone-not-reached (err u109))
 (define-constant err-invalid-milestone (err u110))
+(define-constant err-insufficient-balance (err u111))
+(define-constant err-zero-amount (err u112))
 
 (define-map nft-offers
   { nft-id: uint, offer-id: uint }
@@ -597,5 +599,61 @@
   (match (map-get? sales-performance { nft-id: nft-id })
     some-performance (ok (get current-royalty-rate some-performance))
     (ok u10)
+  )
+)
+
+(define-map withdrawal-pool
+  { collaborator: principal }
+  { pending-balance: uint }
+)
+
+(define-public (deposit-to-pool (collaborator principal) (amount uint))
+  (let
+    (
+      (current-balance (default-to 
+        { pending-balance: u0 }
+        (map-get? withdrawal-pool { collaborator: collaborator })
+      ))
+      (new-balance (+ (get pending-balance current-balance) amount))
+    )
+    (asserts! (> amount u0) err-zero-amount)
+    (map-set withdrawal-pool
+      { collaborator: collaborator }
+      { pending-balance: new-balance }
+    )
+    (ok true)
+  )
+)
+
+(define-public (withdraw-from-pool)
+  (let
+    (
+      (balance-entry (unwrap! (map-get? withdrawal-pool { collaborator: tx-sender }) err-not-found))
+      (amount (get pending-balance balance-entry))
+    )
+    (asserts! (> amount u0) err-insufficient-balance)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (map-set withdrawal-pool
+      { collaborator: tx-sender }
+      { pending-balance: u0 }
+    )
+    (ok amount)
+  )
+)
+
+(define-read-only (get-pending-withdrawal (collaborator principal))
+  (match (map-get? withdrawal-pool { collaborator: collaborator })
+    some-entry (ok (get pending-balance some-entry))
+    (ok u0)
+  )
+)
+
+(define-private (distribute-to-pool (nft-id uint) (collaborator principal) (amount uint))
+  (if (> amount u0)
+    (match (deposit-to-pool collaborator amount)
+      success true
+      error false
+    )
+    false
   )
 )
